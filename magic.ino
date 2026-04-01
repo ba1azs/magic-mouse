@@ -65,6 +65,7 @@ bool apStarted = false;
 bool rtcAvailable = false;
 bool mpuAvailable = false;
 bool gyroMouseEnabled = false;
+bool jiggleEnabled = true; // default ON
 
 // Default / current MPU offsets
 float accelOffsetX = 0.8085f;
@@ -149,8 +150,8 @@ button{
 </style>
 </head>
 <body>
-
-<h2>ESP32 Firmware Update</h2>
+<h1 style="text-align:center;">Magic Mouse Settings</h1>
+<h2>Magic mouse Firmware Update</h2>
 
 <input type="file" id="file">
 <br><br>
@@ -178,6 +179,14 @@ button{
   <button onclick="recalibrateGyro()">Recalibrate gyroscope</button>
   <div id="gyroStatus"></div>
   <div id="recalStatus"></div>
+</div>
+
+<div class="section">
+  <h2>Mouse Jiggle</h2>
+  <div class="small">Prevents sleep by moving the cursor.</div>
+  <div class="state" id="jiggleState">Loading state...</div>
+  <button onclick="toggleJiggle()">Toggle Jiggle</button>
+  <div id="jiggleStatus"></div>
 </div>
 
 <div class="section">
@@ -277,6 +286,30 @@ function refreshGyroState(){
   xhr.send();
 }
 
+function refreshJiggleState(){
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState == 4 && xhr.status == 200){
+      document.getElementById("jiggleState").innerHTML = xhr.responseText;
+    }
+  };
+  xhr.open("GET", "/jigglestate", true);
+  xhr.send();
+}
+
+function toggleJiggle(){
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState == 4){
+      document.getElementById("jiggleStatus").innerHTML = xhr.responseText;
+      refreshJiggleState();
+    }
+  };
+  xhr.open("POST", "/togglejiggle", true);
+  xhr.send();
+  document.getElementById("jiggleStatus").innerHTML = "Changing state...";
+}
+
 function toggleGyro(){
   let xhr = new XMLHttpRequest();
   xhr.onreadystatechange = function(){
@@ -332,6 +365,7 @@ window.onload = function(){
   refreshGyroState();
   refreshRtcTime();
   refreshGPIO();
+  refreshJiggleState();
 };
 </script>
 
@@ -366,7 +400,7 @@ void vibrateHotspotOn() {
 }
 
 void vibrateHotspotOff() {
-  vibratePattern(3, 80, 100);
+  vibratePattern(3, 300, 200);
 }
 
 // ---------------- PERSISTENCE ----------------
@@ -642,6 +676,9 @@ void handleGyroMouse() {
   if (!mpuAvailable) return;
   if (!bleMouse.isConnected()) return;
 
+  static float smoothGZ = 0;
+  static float smoothGY = 0;
+
   unsigned long now = millis();
   if (now - lastGyroMove < gyroMoveInterval) return;
   lastGyroMove = now;
@@ -649,12 +686,32 @@ void handleGyroMouse() {
   float ax, ay, az, gx, gy, gz;
   readCorrectedMPU(ax, ay, az, gx, gy, gz);
 
-  if (fabs(gx) < GYRO_MOUSE_DEADZONE) gx = 0;
-  if (fabs(gy) < GYRO_MOUSE_DEADZONE) gy = 0;
+  // ---------------- SETTINGS ----------------
+  const float DEADZONE = 0.03f;
+  const float SMOOTHING = 0.85f;     // higher = smoother
+  const float BASE_SPEED = 12.0f;    // base sensitivity
+  const float ACCEL_MULT = 2.5f;     // dynamic acceleration
 
-  int moveX = (int)round(gy * GYRO_MOUSE_SCALE);
-  int moveY = (int)round(gx * GYRO_MOUSE_SCALE);
+  // ---------------- DEADZONE ----------------
+  if (fabs(gz) < DEADZONE) gz = 0;
+  if (fabs(gy) < DEADZONE) gy = 0;
 
+  // ---------------- SMOOTHING ----------------
+  smoothGZ = smoothGZ * SMOOTHING + gz * (1.0f - SMOOTHING);
+  smoothGY = smoothGY * SMOOTHING + gy * (1.0f - SMOOTHING);
+
+  // ---------------- ACCELERATION CURVE ----------------
+  float speedX = smoothGZ * BASE_SPEED;
+  float speedY = smoothGY * BASE_SPEED;
+
+  speedX *= (1.0f + fabs(speedX) * ACCEL_MULT);
+  speedY *= (1.0f + fabs(speedY) * ACCEL_MULT);
+
+  // ---------------- AXIS MAPPING ----------------
+  int moveX = (int)round(-speedX);  // pitch → horizontal (fixed)
+  int moveY = (int)round(speedY);  // roll → vertical (fixed)
+
+  // ---------------- MOVE ----------------
   if (moveX != 0 || moveY != 0) {
     bleMouse.move(moveX, moveY);
   }
@@ -677,6 +734,40 @@ void jiggle() {
   printRTCNow();
 }
 
+void loadJiggleSetting() {
+  prefs.begin("settings", true);
+  jiggleEnabled = prefs.getBool("jiggle", true); // default ON
+  prefs.end();
+
+  Serial.printf("Jiggle loaded: %s\n", jiggleEnabled ? "ON" : "OFF");
+}
+
+void saveJiggleSetting() {
+  prefs.begin("settings", false);
+  prefs.putBool("jiggle", jiggleEnabled);
+  prefs.end();
+
+  Serial.printf("Jiggle saved: %s\n", jiggleEnabled ? "ON" : "OFF");
+}
+
+void handleJiggleState() {
+  String msg = "Jiggle: ";
+  msg += jiggleEnabled ? "ON" : "OFF";
+  server.send(200, "text/plain", msg);
+}
+
+void handleToggleJiggle() {
+  jiggleEnabled = !jiggleEnabled;
+  saveJiggleSetting();
+
+  if (jiggleEnabled) {
+    vibratePattern(2, 120, 100); // ON feedback
+    server.send(200, "text/plain", "Jiggle enabled");
+  } else {
+    vibratePattern(1, 300, 0); // OFF feedback
+    server.send(200, "text/plain", "Jiggle disabled");
+  }
+}
 // ---------------- OTA / TIME / GYRO / GPIO HANDLERS ----------------
 
 void handleRoot() {
@@ -851,6 +942,8 @@ void setupWebServer() {
   server.on("/togglegyro", HTTP_POST, handleToggleGyro);
   server.on("/recalibrate", HTTP_POST, handleRecalibrate);
   server.on("/gpiostate", HTTP_GET, handleGPIOState);
+  server.on("/jigglestate", HTTP_GET, handleJiggleState);
+  server.on("/togglejiggle", HTTP_POST, handleToggleJiggle);
 
   server.begin();
 }
@@ -931,6 +1024,8 @@ void manageHotspotByOrientation() {
   }
 }
 
+
+
 // ---------------- SETUP ----------------
 
 void setup() {
@@ -971,6 +1066,8 @@ void setup() {
     printMPUCorrected();
   }
 
+  loadJiggleSetting();
+
   BLESecurity *pSecurity = new BLESecurity();
   pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
   pSecurity->setCapability(ESP_IO_CAP_NONE);
@@ -1008,7 +1105,7 @@ void loop() {
 
   unsigned long now = millis();
 
-  if (!gyroMouseEnabled && bleMouse.isConnected() && (now - lastJiggle >= jiggleInterval)) {
+  if (jiggleEnabled && !gyroMouseEnabled && bleMouse.isConnected() && (now - lastJiggle >= jiggleInterval)) {
     jiggle();
     lastJiggle = now;
   }
